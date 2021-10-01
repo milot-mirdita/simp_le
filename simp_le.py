@@ -43,6 +43,7 @@ import pkg_resources
 import six
 from six.moves import zip  # pylint: disable=redefined-builtin
 
+from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -1031,6 +1032,12 @@ def create_parser():
         help='Directory URI for the CA ACME API endpoint.',
     )
     http.add_argument(
+        '--preferred_chain',  default=None,
+        help='If the CA offers multiple certificate chains, prefer the chain with '
+        'an issuer matching this Subject Common Name. If no match, the default '
+        'offered chain will be used.',
+    )
+    http.add_argument(
         '--ca_bundle', metavar='PATH', default=None,
         help='Path to alternate CA bundle.',
     )
@@ -1400,10 +1407,12 @@ def registered_client(args, existing_account_key, existing_account_reg):
     return client
 
 
-def finalize_order(client, order):
+def finalize_order(client, order, fetch_alternative_chains=False):,
     """Finalize the specified order and return the order resource."""
     try:
-        finalized_order = client.poll_and_finalize(order)
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=90)
+        order = client.poll_authorizations(order, deadline)
+        finalized_order = client.finalize_order(order, deadline, fetch_alternative_chains=fetch_alternative_chains)
     except acme_errors.PollError as error:
         if error.timeout:
             logger.error(
@@ -1453,6 +1462,37 @@ def poll_and_answer(client, authorizations, roots):
         else:
             raise Error('Authorization status timed out.')
 
+# Finds one CERTIFICATE stricttextualmsg according to rfc7468#section-3.
+# Does not validate the base64text - use crypto.load_certificate.
+CERT_PEM_REGEX = re.compile(
+    b"""-----BEGIN CERTIFICATE-----\r?
+.+?\r?
+-----END CERTIFICATE-----\r?
+""",
+    re.DOTALL # DOTALL (/s) because the base64text may include newlines
+)
+
+def find_chain_with_issuer(fullchains, issuer_cn):
+    """Chooses the first certificate chain from fullchains which contains an
+    Issuer Subject Common Name matching issuer_cn.
+    :param fullchains: The list of fullchains in PEM chain format.
+    :type fullchains: `list` of `str`
+    :param `str` issuer_cn: The exact Subject Common Name to match against any
+        issuer in the certificate chain.
+    :returns: The best-matching fullchain, PEM-encoded, or the first if none match.
+    :rtype: `str`
+    """
+    for chain in fullchains:
+        certs = [x509.load_pem_x509_certificate(cert, default_backend()) \
+                 for cert in CERT_PEM_REGEX.findall(chain.encode())]
+        # Iterate the fullchain beginning from the leaf. For each certificate encountered,
+        # match against Issuer Subject CN.
+        for cert in certs:
+            cert_issuer_cn = cert.issuer.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            if cert_issuer_cn and cert_issuer_cn[0].value == issuer_cn:
+                return chain
+
+    return fullchains[0]
 
 def persist_new_data(args, existing_data):
     """Issue and persist new key/cert/chain."""
@@ -1487,10 +1527,16 @@ def persist_new_data(args, existing_data):
         raise Error('CA did not offer http-01-only challenge combo. '
                     'This client is unable to solve any other challenges.')
 
+    get_alt_chains = args.preferred_chain is not None
     try:
         poll_and_answer(client, authorizations, roots)
-        order = finalize_order(client, order)
-        pems = list(split_pems(order.fullchain_pem))
+        order = finalize_order(client, order, get_alt_chains)
+        fullchain = order.fullchain_pem
+        if get_alt_chains and order.alternative_fullchains_pem:
+            fullchain = find_chain_with_issuer([fullchain] + \
+                                                order.alternative_fullchains_pem,
+                                                args.preferred_chain)
+        pems = list(split_pems(fullchain))
 
         persist_data(args, existing_data, new_data=IOPlugin.Data(
             account_key=client.net.key,
